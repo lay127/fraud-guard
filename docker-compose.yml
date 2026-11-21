@@ -1,0 +1,66 @@
+# Starter kit — Projeto Integrador (Sistemas Distribuídos e Computação em Nuvem)
+# Development environment: inference service + infrastructure dependencies.
+# The group adds the gateway, the batch API, the worker and observability.
+# Only entry points are published on the host; services reach each other by
+# name (cache:6379, broker:5672, history-db:5432) on the Compose network.
+name: ml-inference-platform
+
+services:
+  inference:
+    build: ./services/inference
+    image: inference:0.1.0
+    environment:
+      MODEL_VERSION: ${MODEL_VERSION}
+      CPU_WORK_MS: ${CPU_WORK_MS}
+      REDIS_URL: redis://cache:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  cache:
+    image: redis:7.4.7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Kafka (apache/kafka, KRaft mode) is an equally valid choice; justify it.
+  broker:
+    image: rabbitmq:4.1.4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${BROKER_USER}
+      RABBITMQ_DEFAULT_PASS: ${BROKER_PASSWORD}
+    ports:
+      - "15672:15672"   # management UI
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # Database per service: each service that persists data gets its own
+  # database (or its own instance), never a shared schema.
+  history-db:
+    image: postgres:17.7-alpine
+    environment:
+      POSTGRES_USER: ${HISTORY_DB_USER}
+      POSTGRES_PASSWORD: ${HISTORY_DB_PASSWORD}
+      POSTGRES_DB: history
+    volumes:
+      - history-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d history"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  history-data:
