@@ -1,18 +1,30 @@
-# Starter kit — Projeto Integrador (Sistemas Distribuídos e Computação em Nuvem)
-# Development environment: inference service + infrastructure dependencies.
-# The group adds the gateway, the batch API, the worker and observability.
-# Only entry points are published on the host; services reach each other by
-# name (cache:6379, broker:5672, history-db:5432) on the Compose network.
-name: ml-inference-platform
+# FraudGuard: ambiente de desenvolvimento (Checkpoint 2).
+# Adaptado do starter kit da disciplina: o RabbitMQ foi trocado por Apache
+# Kafka (modo KRaft, sem ZooKeeper) e o PostgreSQL segue "um banco por
+# serviço" (db_transacoes e db_predicoes), como no diagrama da proposta.
+#
+# Segredos e versões vêm do arquivo .env (copie de .env.example).
+# Só as portas de entrada são publicadas no host; os serviços se encontram
+# pelo nome na rede do Compose (cache:6379, kafka:9092, transacoes-db:5432,
+# predicoes-db:5432, inference:8000).
+#
+# Os serviços gateway, api e worker estão no perfil "servicos" e só sobem
+# com --profile servicos, depois que cada um tiver o seu Dockerfile.
+name: fraud-guard
 
 services:
+  # ---------------------------------------------------------------------------
+  # Serviços da aplicação
+  # ---------------------------------------------------------------------------
+
+  # Serviço de Inferência (base do starter kit): caminho síncrono, score 0-1.
   inference:
     build: ./services/inference
-    image: inference:0.1.0
+    image: fraud-guard/inference:0.1.0
     environment:
       MODEL_VERSION: ${MODEL_VERSION}
       CPU_WORK_MS: ${CPU_WORK_MS}
-      REDIS_URL: redis://cache:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD}@cache:6379/0
     ports:
       - "8000:8000"
     depends_on:
@@ -23,44 +35,179 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
+  # API Gateway (Pessoa 2): autenticação JWT, rate limit e roteamento.
+  # TODO(Pessoa 2): criar services/gateway/Dockerfile expondo a porta 8000
+  # com /readyz, e então tirar a linha "profiles".
+  gateway:
+    profiles: ["servicos"]
+    build: ./services/gateway
+    image: fraud-guard/gateway:0.1.0
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      INFERENCE_URL: http://inference:8000
+      TRANSACOES_URL: http://api:8000
+      REDIS_URL: redis://:${REDIS_PASSWORD}@cache:6379/1
+    ports:
+      - "8080:8000"
+    depends_on:
+      inference:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Serviço de Transações / API de pedidos: recebe lotes (POST /lotes),
+  # grava no db_transacoes e publica no tópico do Kafka.
+  # TODO(Pessoa 2 ou 3): criar services/api/Dockerfile expondo a porta 8000
+  # com /readyz, e então tirar a linha "profiles".
+  api:
+    profiles: ["servicos"]
+    build: ./services/api
+    image: fraud-guard/api:0.1.0
+    environment:
+      DATABASE_URL: postgresql://${TRANSACOES_DB_USER}:${TRANSACOES_DB_PASSWORD}@transacoes-db:5432/transacoes
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_LOTES: ${KAFKA_TOPIC_LOTES}
+    depends_on:
+      transacoes-db:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Worker de Fraude (Pessoa 3): consome o tópico de lotes (consumer group),
+  # pede o score à inferência e grava o resultado no db_predicoes.
+  # TODO(Pessoa 3): criar services/worker/Dockerfile e então tirar a linha
+  # "profiles". O worker não tem HTTP; se quiser healthcheck, use um arquivo
+  # de heartbeat (ex.: test: ["CMD", "test", "-f", "/tmp/worker-alive"]).
+  worker:
+    profiles: ["servicos"]
+    build: ./services/worker
+    image: fraud-guard/worker:0.1.0
+    environment:
+      DATABASE_URL: postgresql://${PREDICOES_DB_USER}:${PREDICOES_DB_PASSWORD}@predicoes-db:5432/predicoes
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_LOTES: ${KAFKA_TOPIC_LOTES}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ}
+      KAFKA_CONSUMER_GROUP: worker-fraude
+      INFERENCE_URL: http://inference:8000
+    depends_on:
+      predicoes-db:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      inference:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Infraestrutura
+  # ---------------------------------------------------------------------------
+
+  # Redis: cache de predições (TTL) e lock distribuído.
   cache:
-    image: redis:7.4.7-alpine
+    image: redis:${REDIS_VERSION}
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # Kafka (apache/kafka, KRaft mode) is an equally valid choice; justify it.
-  broker:
-    image: rabbitmq:4.1.4-management-alpine
+  # Apache Kafka em modo KRaft (um nó faz papel de broker e de controller).
+  kafka:
+    image: apache/kafka:${KAFKA_VERSION}
     environment:
-      RABBITMQ_DEFAULT_USER: ${BROKER_USER}
-      RABBITMQ_DEFAULT_PASS: ${BROKER_PASSWORD}
-    ports:
-      - "15672:15672"   # management UI
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Um único broker: fatores de replicação internos precisam ser 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Tópicos são criados explicitamente pelo kafka-init.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
       interval: 10s
       timeout: 10s
       retries: 10
+      start_period: 20s
 
-  # Database per service: each service that persists data gets its own
-  # database (or its own instance), never a shared schema.
-  history-db:
-    image: postgres:17.7-alpine
+  # Cria os tópicos uma vez e termina (idempotente: --if-not-exists).
+  # transacoes.lote tem 3 partições para o worker poder escalar no consumer
+  # group; a DLQ recebe as mensagens que falharem depois dos retries.
+  kafka-init:
+    image: apache/kafka:${KAFKA_VERSION}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$KAFKA_TOPIC_LOTES" --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$KAFKA_TOPIC_DLQ" --partitions 1 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
     environment:
-      POSTGRES_USER: ${HISTORY_DB_USER}
-      POSTGRES_PASSWORD: ${HISTORY_DB_PASSWORD}
-      POSTGRES_DB: history
+      KAFKA_TOPIC_LOTES: ${KAFKA_TOPIC_LOTES}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+
+  # Banco por serviço: db_transacoes (dono: Serviço de Transações).
+  transacoes-db:
+    image: postgres:${POSTGRES_VERSION}
+    environment:
+      POSTGRES_USER: ${TRANSACOES_DB_USER}
+      POSTGRES_PASSWORD: ${TRANSACOES_DB_PASSWORD}
+      POSTGRES_DB: transacoes
     volumes:
-      - history-data:/var/lib/postgresql/data
+      - transacoes-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d history"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d transacoes"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Banco por serviço: db_predicoes (dono: Worker de Fraude).
+  predicoes-db:
+    image: postgres:${POSTGRES_VERSION}
+    environment:
+      POSTGRES_USER: ${PREDICOES_DB_USER}
+      POSTGRES_PASSWORD: ${PREDICOES_DB_PASSWORD}
+      POSTGRES_DB: predicoes
+    volumes:
+      - predicoes-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d predicoes"]
       interval: 10s
       timeout: 5s
       retries: 5
 
 volumes:
-  history-data:
+  kafka-data:
+  transacoes-data:
+  predicoes-data:
